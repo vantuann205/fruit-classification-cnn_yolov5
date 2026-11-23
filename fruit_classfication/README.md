@@ -8,7 +8,7 @@ fruit_classfication/
 ├── notebooks/   Notebook huấn luyện CNN, YOLOv5 và đánh giá
 ├── models/      File trọng số hoặc mô hình đã huấn luyện
 ├── demo/        Mã nguồn và tài nguyên chạy ứng dụng demo
-└── bao-cao/     Báo cáo, slide và tài liệu liên quan
+└── report/      Báo cáo, slide và tài liệu liên quan
 ```
 
 ## Nội dung từng thư mục
@@ -17,6 +17,6 @@ fruit_classfication/
 - `notebooks/`: lưu notebook theo từng bước, chẳng hạn tiền xử lý dữ liệu, huấn luyện CNN, huấn luyện YOLOv5 và đánh giá kết quả.
 - `models/`: lưu checkpoint/trọng số đã huấn luyện cùng thông tin về kiến trúc, phiên bản và cách nạp model. Các file model lớn có thể dùng Git LFS hoặc liên kết tải.
 - `demo/`: lưu mã nguồn, cấu hình và hướng dẫn chạy ứng dụng minh họa dự đoán.
-- `bao-cao/`: lưu báo cáo, slide thuyết trình và các tài liệu tổng kết dự án.
+- `report/`: lưu báo cáo, slide thuyết trình và các tài liệu tổng kết dự án.
 
 Các thư mục hiện được tạo sẵn; hãy thêm dataset, notebook, model, demo và tài liệu tương ứng vào đúng vị trí.

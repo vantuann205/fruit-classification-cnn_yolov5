@@ -10,7 +10,7 @@ fruit_classfication/
 ├── notebooks/   Notebook CNN, YOLOv5 và đánh giá
 ├── models/      Các mô hình đã huấn luyện
 ├── demo/        Ứng dụng minh họa dự đoán
-└── bao-cao/     Báo cáo và slide
+└── report/      Báo cáo và slide
 ```
 
 Xem [`fruit_classfication/README.md`](fruit_classfication/README.md) để biết chi tiết nội dung từng thư mục.
