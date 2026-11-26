@@ -30,6 +30,7 @@ fruit_classification/data/*.zip
 *.weights
 *.engine
 *.bin
+!fruit_classfication/models/yolov5_cls_best.pt
 
 # YOLO outputs & training runs
 runs/
