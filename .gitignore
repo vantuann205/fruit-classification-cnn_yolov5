@@ -1,0 +1,56 @@
+# Dataset directories
+fruit_classfication/data/Fruit/
+fruit_classification/data/Fruit/
+**/data/Fruit/
+**/Fruit/
+
+# Image formats
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.webp
+*.tiff
+*.tif
+*.ico
+
+# Compressed files & datasets
+fruit_classfication/data/*.zip
+fruit_classification/data/*.zip
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# Model weights & checkpoints
+*.pt
+*.pth
+*.onnx
+*.weights
+*.engine
+*.bin
+
+# YOLO outputs & training runs
+runs/
+**/runs/
+
+# Python & Jupyter cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Keep .gitkeep files
+!**/.gitkeep
