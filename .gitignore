@@ -1,0 +1,30 @@
+# Local raw images (T02: kept on local machine, never pushed to GitHub)
+raw_data/
+fruit_classfication/data/raw/
+fruit_classfication/data/Fruit/
+fruit_classfication/data/*.zip
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# Training / YOLO outputs
+runs/
+**/runs/
+
+# Python & Jupyter cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
