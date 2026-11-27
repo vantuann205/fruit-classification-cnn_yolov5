@@ -64,10 +64,10 @@ def load_font(size: int = 16, bold: bool = False) -> ImageFont.FreeTypeFont | Im
     return ImageFont.load_default()
 
 
-PREFERRED_SAMPLES = {
-    "Buoi": "buoi_train_0002_a1d8f58a.jpg",
-    "Hong": "hong_train_0007_4ed80c25.jpg",
-    "dudu": "dudu_train_0001_029ed772.jpg",
+PREFERRED_SAMPLE_HASHES = {
+    "Buoi": "a1d8f58a",
+    "Hong": "4ed80c25",
+    "dudu": "029ed772",
 }
 
 
@@ -75,9 +75,12 @@ def pick_sample_images(data_dir: Path, seed: int = 7) -> dict[str, Path]:
     rng = random.Random(seed)
     chosen: dict[str, Path] = {}
     for cls in CLASS_NAMES:
-        pref = data_dir / "train" / cls / PREFERRED_SAMPLES.get(cls, "")
-        if pref.is_file():
-            chosen[cls] = pref
+        sha8 = PREFERRED_SAMPLE_HASHES.get(cls, "")
+        matches = sorted((data_dir / "train" / cls).glob(f"*{sha8}.jpg")) if sha8 else []
+        if not matches and sha8:
+            matches = sorted(data_dir.rglob(f"*{sha8}.jpg"))
+        if matches:
+            chosen[cls] = matches[0]
             continue
         candidates = sorted((data_dir / "train" / cls).glob("*.jpg"))
         if not candidates:

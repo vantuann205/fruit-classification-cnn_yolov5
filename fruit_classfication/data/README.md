@@ -6,13 +6,13 @@ Bộ dữ liệu phân loại 3 loại trái cây Việt Nam (**Bưởi**, **H�
 
 | Lớp | Tên tiếng Việt / Khoa học | Train (70%) | Val (15%) | Test (15%) | Tổng |
 |---|---|---:|---:|---:|---:|
-| `Buoi` | Bưởi (*Citrus maxima*) | 1,048 | 224 | 226 | **1,498** |
-| `Hong` | Quả hồng (*Diospyros kaki*) | 1,188 | 254 | 256 | **1,698** |
-| `dudu` | Đu đủ (*Carica papaya*) | 1,305 | 279 | 281 | **1,865** |
-| **Tổng cộng** | | **3,541** | **757** | **763** | **5,061** |
+| `Buoi` | Bưởi (*Citrus maxima*) | 1,040 | 223 | 224 | **1,487** |
+| `Hong` | Quả hồng (*Diospyros kaki*) | 1,174 | 251 | 253 | **1,678** |
+| `dudu` | Đu đủ (*Carica papaya*) | 1,291 | 276 | 278 | **1,845** |
+| **Tổng cộng** | | **3,505** | **750** | **755** | **5,010** |
 
 - `class_to_idx.json`: `{"Buoi": 0, "Hong": 1, "dudu": 2}`
-- Tổng dung lượng thư mục `data/` sau resize cạnh dài `256px`: nhẹ, phù hợp đẩy trực tiếp lên GitHub và clone nhanh trên Google Colab.
+- Dung lượng thư mục `data/` sau resize cạnh dài `256px`: nhẹ, phù hợp đẩy trực tiếp lên GitHub và clone nhanh trên Google Colab.
 
 ## 2. Nguồn thu thập dữ liệu thô (T02)
 
@@ -30,18 +30,18 @@ Tổng cộng **8,344** ảnh thô đã được thu thập cục bộ (`Buoi`: 
 
 | Lớp | Kaggle / Fruit-262 / Fruits-360 / Mendeley | Bing Images | iNaturalist | GitHub `sbarbonjr/Papaya` | Tổng |
 |---|---:|---:|---:|---:|---:|
-| `Buoi` | 647 | 822 | 29 | 0 | **1,498** |
-| `Hong` | 721 | 764 | 213 | 0 | **1,698** |
-| `dudu` | 892 | 639 | 302 | 32 | **1,865** |
+| `Buoi` | 647 | 811 | 29 | 0 | **1,487** |
+| `Hong` | 721 | 744 | 213 | 0 | **1,678** |
+| `dudu` | 879 | 632 | 302 | 32 | **1,845** |
 
 ## 3. Quy trình làm sạch và chia tập (T03)
 
-1. **Lọc chất lượng cơ bản**: kiểm tra giải mã ảnh hoàn chỉnh, chuẩn hóa xoay EXIF, chuyển không gian màu RGB; loại ảnh quá nhỏ (`min(w, h) < 96px`), tỉ lệ khung hình quá lệch (`aspect ratio > 2.5`), ảnh đơn sắc/ít biến thiên hoặc tài liệu văn bản đen trắng.
+1. **Lọc chất lượng cơ bản**: kiểm tra giải mã ảnh hoàn chỉnh, chuẩn hóa xoay EXIF, chuyển không gian màu RGB; loại ảnh quá nhỏ (`min(w, h) < 96px`), tỉ lệ khung hình quá lệch (`aspect ratio > 2.5`), ảnh đơn sắc/ít biến thiên hoặc tài liệu văn bản đen trắng, và loại bỏ nguồn nhiễu nặng (`openverse`, `wikimedia`).
 2. **Khử trùng lặp chính xác & gần giống (Anti-Leakage)**:
    - Khử trùng lặp chính xác theo **SHA256** (cả byte gốc và pixel RGB).
    - Khử trùng lặp cảm nhận theo **64-bit dHash** (khoảng cách Hamming $\le 6$ với ảnh tự nhiên, $\le 10$ với chuỗi khung hình xoay Fruits-360) cả trong cùng lớp lẫn xuyên lớp, đảm bảo không rò rỉ ảnh trùng giữa `train`, `val` và `test`.
 3. **Lọc ảnh sai lớp & nhiễu bằng CLIP (`ViT-B-32`) + kiểm tra trực quan**:
-   - Loại bỏ các ảnh ngoài chủ đề do tìm kiếm từ khóa kéo theo (như hoa hồng, khối gỗ, ảnh chân dung/hội nghị, poster quảng cáo/infographic nhiều chữ, món ăn chế biến/thịt/gỏi, cảnh cây từ xa không rõ quả, quả *Asimina triloba* pawpaw lẫn trong đu đủ, chôm chôm/dưa hấu/lựu lẫn trong bưởi).
+   - Đánh giá trên toàn bộ 5,825 ảnh duy nhất và loại bỏ 815 ảnh ngoài chủ đề/sai lớp (hoa hồng, khối gỗ, poster quảng cáo/infographic nhiều chữ, chân dung/hội nghị, món ăn chế biến/thịt/gỏi, cảnh cây từ xa không rõ quả, côn trùng, quả *Asimina triloba* pawpaw lẫn trong đu đủ, chôm chôm/dưa hấu/lựu lẫn trong bưởi), giữ lại đúng **5,010** ảnh đã qua xác minh CLIP.
 4. **Đặt tên thống nhất, Resize và Chia tập**:
    - Resize giữ nguyên tỉ lệ khung hình với cạnh dài nhất bằng **`256px`** (`LANCZOS`, JPEG quality 90).
    - Đặt tên thống nhất: `<lop>_<split>_<stt>_<sha256[:8]>.jpg` (ví dụ `buoi_train_0001_a1b2c3d4.jpg`).
