@@ -9,36 +9,46 @@ import random
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 try:
     from .preprocess import (
         CLASS_NAMES,
         AugmentConfig,
-        apply_train_augmentations,
-        denormalize_array,
-        load_rgb_image,
-        normalize_image,
-        random_color_jitter,
-        random_flip,
+        color_jitter,
+        denormalize,
+        flip_horizontal,
+        load_image,
+        normalize,
         random_resized_crop,
-        random_rotate,
-        resize_224,
+        resize_and_center_crop,
+        rotate_image,
     )
 except ImportError:
     from preprocess import (
         CLASS_NAMES,
         AugmentConfig,
-        apply_train_augmentations,
-        denormalize_array,
-        load_rgb_image,
-        normalize_image,
-        random_color_jitter,
-        random_flip,
+        color_jitter,
+        denormalize,
+        flip_horizontal,
+        load_image,
+        normalize,
         random_resized_crop,
-        random_rotate,
-        resize_224,
+        resize_and_center_crop,
+        rotate_image,
     )
+
+
+def _augment_to_pil(img: Image.Image, cfg: AugmentConfig, seed: int) -> Image.Image:
+    """Áp dụng toàn bộ augmentation pipeline, trả về PIL Image 224x224."""
+    rng = random.Random(seed)
+    img = random_resized_crop(img, cfg.img_size, cfg.crop_scale, cfg.crop_ratio, rng=rng)
+    img = flip_horizontal(img, prob=cfg.hflip_prob, rng=rng)
+    img = rotate_image(img, max_degrees=cfg.rotation_degrees, rng=rng)
+    img = color_jitter(img, cfg.brightness, cfg.contrast, cfg.saturation, rng=rng)
+    return img
+
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/google-carlito-fonts/Carlito-Regular.ttf",
@@ -134,19 +144,20 @@ def generate_before_after_grid(samples: dict[str, Path], out_path: Path) -> None
         y = top_header + r_idx * (tile + pad + 18)
         draw.multiline_text((left_col // 2, y + tile // 2), cls_labels[cls], fill=(15, 23, 42), font=f_cls, anchor="mm", align="center")
 
-        orig = load_rgb_image(samples[cls])
+        orig = load_image(samples[cls])
         orig_box = Image.new("RGB", (tile, tile), (226, 232, 240))
         thumb = orig.copy()
         thumb.thumbnail((tile, tile), Image.Resampling.LANCZOS)
         orig_box.paste(thumb, ((tile - thumb.width) // 2, (tile - thumb.height) // 2))
 
-        eval_224 = resize_224(orig, 224, keep_aspect_center_crop=True).resize((tile, tile))
-        aug1 = apply_train_augmentations(orig, cfg=cfg, seed=101 + r_idx).resize((tile, tile))
-        aug2 = apply_train_augmentations(orig, cfg=cfg, seed=202 + r_idx).resize((tile, tile))
-        aug3 = apply_train_augmentations(orig, cfg=cfg, seed=303 + r_idx).resize((tile, tile))
+        eval_224 = resize_and_center_crop(orig, size=224).resize((tile, tile))
+        aug1 = _augment_to_pil(orig, cfg=cfg, seed=101 + r_idx).resize((tile, tile))
+        aug2 = _augment_to_pil(orig, cfg=cfg, seed=202 + r_idx).resize((tile, tile))
+        aug3 = _augment_to_pil(orig, cfg=cfg, seed=303 + r_idx).resize((tile, tile))
 
-        norm_arr = normalize_image(apply_train_augmentations(orig, cfg=cfg, seed=101 + r_idx), model_name="mobilenet_v2")
-        restored = denormalize_array(norm_arr, model_name="mobilenet_v2").resize((tile, tile))
+        aug_pil = _augment_to_pil(orig, cfg=cfg, seed=101 + r_idx)
+        norm_arr = normalize(np.asarray(aug_pil, dtype=np.uint8))
+        restored = denormalize(norm_arr).resize((tile, tile))
 
         row_imgs = [orig_box, eval_224, aug1, aug2, aug3, restored]
         captions = [f"{orig.width}x{orig.height}", "224x224", "seed=" + str(101 + r_idx), "seed=" + str(202 + r_idx), "seed=" + str(303 + r_idx), "ImageNet mean/std"]
@@ -193,12 +204,12 @@ def generate_step_breakdown(samples: dict[str, Path], out_path: Path) -> None:
         y = top_header + r_idx * (tile + pad + 12)
         draw.text((left_col // 2, y + tile // 2), cls, fill=(15, 23, 42), font=f_cls, anchor="mm")
 
-        orig = load_rgb_image(samples[cls])
-        base_224 = resize_224(orig, 224, keep_aspect_center_crop=True)
-        rot_224 = random_rotate(base_224, angle=20.0)
-        flip_224 = random_flip(base_224, hflip_prob=1.0, vflip_prob=0.0, rng=random.Random(7))
-        bright_224 = random_color_jitter(base_224, brightness=0.35, contrast=0.25, saturation=0.25, rng=random.Random(9 + r_idx))
-        crop_224 = random_resized_crop(orig, img_size=224, scale=(0.65, 0.78), rng=random.Random(12 + r_idx))
+        orig = load_image(samples[cls])
+        base_224 = resize_and_center_crop(orig, size=224)
+        rot_224  = rotate_image(base_224, max_degrees=20.0, rng=random.Random(7))
+        flip_224 = flip_horizontal(base_224, prob=1.0, rng=random.Random(7))
+        bright_224 = color_jitter(base_224, brightness=0.35, contrast=0.25, saturation=0.25, rng=random.Random(9 + r_idx))
+        crop_224   = random_resized_crop(orig, size=224, scale=(0.65, 0.78), rng=random.Random(12 + r_idx))
 
         orig_box = Image.new("RGB", (tile, tile), (241, 245, 249))
         th = orig.copy()

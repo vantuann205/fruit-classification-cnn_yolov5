@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Preprocessing and data augmentation utilities for fruit classification.
+"""
+Tiền xử lý và tăng cường dữ liệu ảnh cho bài toán phân loại trái cây.
 
-Supports shared 224x224 preprocessing, geometric/photometric augmentations
-(rotation, flip, brightness/color jitter, random crop), and model-specific
-normalization for PyTorch CNN (MobileNetV2/ResNet50), TensorFlow/Keras
-MobileNetV2, and Ultralytics YOLOv5-cls.
+Cấu trúc file:
+  Phần 1 — Hằng số & cấu hình (class names, ImageNet mean/std, AugmentConfig)
+  Phần 2 — Các hàm xử lý ảnh (viết tường minh bằng NumPy, giải thích từng bước)
+  Phần 3 — Pipeline tổng hợp (preprocess_train / preprocess_eval)
+  Phần 4 — DataLoader wrappers (torchvision & tf.keras, dùng khi huấn luyện trên GPU)
+  Phần 5 — Self-test & CLI
+
+Yêu cầu tối thiểu: Python 3.9+, Pillow, NumPy
 """
 
 from __future__ import annotations
@@ -15,407 +20,554 @@ import math
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from PIL import Image, ImageEnhance, ImageOps, ImageStat
+import numpy as np
+from PIL import Image, ImageOps
 
+# =============================================================================
+# Phần 1 — Hằng số & cấu hình
+# =============================================================================
+
+# Tên 3 lớp trái cây trong dataset (phải khớp đúng với tên thư mục)
 CLASS_NAMES = ("Buoi", "Hong", "dudu")
-DEFAULT_IMG_SIZE = 224
 
-# Normalization specs per target model family.
-# - PyTorch torchvision MobileNetV2 / ResNet50 & YOLOv5-cls expect [0, 1] scaled
-#   RGB tensors normalized with ImageNet mean & std.
-# - Keras MobileNetV2 (tf.keras.applications.mobilenet_v2.preprocess_input)
-#   expects RGB values scaled linearly from [0, 255] to [-1, 1].
-MODEL_CONFIGS: dict[str, dict[str, Any]] = {
-    "mobilenet_v2": {
-        "framework": "pytorch",
-        "input_size": (224, 224),
-        "scale_01": True,
-        "mean": (0.485, 0.456, 0.406),
-        "std": (0.229, 0.224, 0.225),
-        "description": "PyTorch torchvision MobileNetV2 (ImageNet normalization)",
-    },
-    "resnet50": {
-        "framework": "pytorch",
-        "input_size": (224, 224),
-        "scale_01": True,
-        "mean": (0.485, 0.456, 0.406),
-        "std": (0.229, 0.224, 0.225),
-        "description": "PyTorch torchvision ResNet50 (ImageNet normalization)",
-    },
-    "yolov5_cls": {
-        "framework": "pytorch",
-        "input_size": (224, 224),
-        "scale_01": True,
-        "mean": (0.485, 0.456, 0.406),
-        "std": (0.229, 0.224, 0.225),
-        "description": "Ultralytics YOLOv5-cls (ImageNet normalization, 224x224)",
-    },
-    "mobilenet_v2_keras": {
-        "framework": "keras",
-        "input_size": (224, 224),
-        "scale_01": True,
-        "mean": (0.5, 0.5, 0.5),
-        "std": (0.5, 0.5, 0.5),
-        "description": "TensorFlow/Keras MobileNetV2 (scaled to [-1, 1])",
-    },
-}
+# Kích thước đầu vào chuẩn của CNN (MobileNetV2, ResNet50, YOLOv5-cls)
+IMG_SIZE = 224
 
-MODEL_ALIASES: dict[str, str] = {
-    "cnn": "mobilenet_v2",
-    "cnn_pytorch": "mobilenet_v2",
-    "mobilenetv2": "mobilenet_v2",
-    "cnn_keras": "mobilenet_v2_keras",
-    "keras": "mobilenet_v2_keras",
-    "yolov5": "yolov5_cls",
-    "yolo": "yolov5_cls",
-}
+# ImageNet mean & std (theo kênh R, G, B) — dùng để chuẩn hoá đầu vào.
+# Các mô hình pretrained (MobileNetV2, ResNet50, YOLOv5) đều được huấn luyện
+# trên ImageNet với chuẩn hoá này, nên ta phải chuẩn hoá ảnh theo cùng cách.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 @dataclass(frozen=True)
 class AugmentConfig:
-    """Hyperparameters for training data augmentation."""
-
-    img_size: int = DEFAULT_IMG_SIZE
-    eval_resize_short: int = 256
-    crop_scale: tuple[float, float] = (0.75, 1.0)
-    crop_ratio: tuple[float, float] = (0.85, 1.15)
-    rotation_degrees: float = 25.0
-    hflip_prob: float = 0.5
-    vflip_prob: float = 0.15
-    brightness: float = 0.25
-    contrast: float = 0.20
-    saturation: float = 0.20
-    hue: float = 0.03
-
-
-def resolve_model_config(model_name: str) -> tuple[str, dict[str, Any]]:
-    """Resolve a model name or alias to its canonical normalization spec."""
-    key = model_name.strip().lower()
-    canonical = MODEL_ALIASES.get(key, key)
-    if canonical not in MODEL_CONFIGS:
-        supported = sorted(set(MODEL_CONFIGS) | set(MODEL_ALIASES))
-        raise ValueError(f"Unsupported model '{model_name}'. Supported: {supported}")
-    return canonical, MODEL_CONFIGS[canonical]
-
-
-def load_rgb_image(source: str | Path | Image.Image) -> Image.Image:
-    """Load an image path or PIL Image, apply EXIF orientation, and convert to RGB."""
-    if isinstance(source, Image.Image):
-        im = source.copy()
-    else:
-        with Image.open(source) as opened:
-            opened.load()
-            im = opened.copy()
-    im = ImageOps.exif_transpose(im)
-    if im.mode in ("RGBA", "LA", "P"):
-        bg = Image.new("RGB", im.size, (255, 255, 255))
-        if im.mode == "P":
-            im = im.convert("RGBA")
-        if im.mode in ("RGBA", "LA"):
-            bg.paste(im, mask=im.split()[-1])
-            im = bg
-        else:
-            im = im.convert("RGB")
-    elif im.mode != "RGB":
-        im = im.convert("RGB")
-    return im
-
-
-def resize_224(
-    img: Image.Image,
-    img_size: int = DEFAULT_IMG_SIZE,
-    keep_aspect_center_crop: bool = False,
-) -> Image.Image:
-    """Resize image to (img_size, img_size).
-
-    When keep_aspect_center_crop is True, resizes the shorter edge to
-    round(img_size / 0.875) (256px for 224px) then center-crops to square.
     """
-    if not keep_aspect_center_crop:
-        return img.resize((img_size, img_size), Image.Resampling.BILINEAR)
+    Các siêu tham số (hyperparameter) cho bước tăng cường dữ liệu khi train.
 
+    Giải thích lý do chọn từng giá trị:
+    - crop_scale (0.75~1.0): cắt ngẫu nhiên 75%~100% diện tích gốc
+      → giúp model học ở nhiều tỷ lệ zoom khác nhau
+    - rotation (±25°): xoay nhẹ, trái cây trong thực tế không bao giờ hoàn toàn thẳng đứng
+    - hflip_prob=0.5: lật ngang 50% — ảnh trái cây đối xứng trái/phải, label không đổi
+    - brightness/contrast/saturation (±25%/±20%/±20%): mô phỏng thay đổi ánh sáng
+    - hue=0.03 (rất nhỏ!): Bưởi xanh và Đu đủ xanh rất giống nhau về màu,
+      nếu dịch chuyển hue nhiều thì model sẽ nhầm lẫn hai loại quả này
+    """
+    img_size:          int   = IMG_SIZE
+    eval_resize_short: int   = 256       # resize cạnh ngắn trước khi center-crop
+    crop_scale:        tuple = (0.75, 1.0)
+    crop_ratio:        tuple = (0.85, 1.15)
+    rotation_degrees:  float = 25.0
+    hflip_prob:        float = 0.5
+    brightness:        float = 0.25
+    contrast:          float = 0.20
+    saturation:        float = 0.20
+    hue:               float = 0.03
+
+
+# =============================================================================
+# Phần 2 — Các hàm xử lý ảnh (tường minh, giải thích từng bước)
+# =============================================================================
+
+
+def load_image(source: str | Path | Image.Image) -> Image.Image:
+    """
+    Đọc ảnh từ đường dẫn (hoặc PIL Image sẵn có), sửa hướng EXIF, chuyển sang RGB.
+
+    Tại sao cần bước này?
+    - Nhiều ảnh chụp bằng điện thoại có metadata EXIF ghi hướng xoay (portrait/landscape).
+      Nếu không sửa, ảnh sẽ bị xoay ngang dù hiển thị đúng trên máy.
+    - Các ảnh PNG/RGBA có kênh alpha (trong suốt) → ghép lên nền trắng để giữ RGB.
+    """
+    if isinstance(source, Image.Image):
+        img = source.copy()
+    else:
+        with Image.open(source) as f:
+            f.load()
+            img = f.copy()
+
+    # Sửa hướng EXIF: đọc tag Orientation trong metadata và xoay/lật ảnh cho đúng
+    img = ImageOps.exif_transpose(img)
+
+    # Chuyển ảnh có kênh alpha (RGBA, PNG trong suốt) sang RGB bằng cách
+    # ghép lên nền trắng → tránh mất thông tin màu khi normalize
+    if img.mode in ("RGBA", "LA", "P"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    return img
+
+
+# -----------------------------------------------------------------------------
+
+
+def resize_and_center_crop(img: Image.Image, size: int = IMG_SIZE) -> Image.Image:
+    """
+    Resize ảnh sao cho cạnh ngắn = 256px, rồi cắt chính giữa thành size×size.
+
+    Tại sao không resize thẳng về 224×224?
+    - Resize thẳng làm biến dạng (méo) tỷ lệ của trái cây.
+    - Cách đúng: resize cạnh ngắn → 256 (giữ tỷ lệ), rồi center-crop 224×224
+      → ảnh vuông không méo, và phần trung tâm (thường chứa trái cây) được giữ lại.
+
+    Dùng cho: ảnh validation & test (không augment, chỉ cần chuẩn hoá kích thước).
+    """
     w, h = img.size
-    short_target = max(img_size, round(img_size / 0.875))
-    scale = short_target / min(w, h)
-    new_w, new_h = max(img_size, round(w * scale)), max(img_size, round(h * scale))
-    resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
-    left = (new_w - img_size) // 2
-    top = (new_h - img_size) // 2
-    return resized.crop((left, top, left + img_size, top + img_size))
+    short_side = min(w, h)
+
+    # Tính tỷ lệ scale để cạnh ngắn = 256
+    scale = 256 / short_side                        # ví dụ: 256/320 = 0.8
+    new_w = max(size, round(w * scale))             # chiều rộng mới
+    new_h = max(size, round(h * scale))             # chiều cao mới
+
+    # Bước 1: resize giữ nguyên tỷ lệ (bilinear = nội suy song tuyến tính)
+    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+    # Bước 2: cắt vùng trung tâm size×size
+    left = (new_w - size) // 2
+    top  = (new_h - size) // 2
+    img  = img.crop((left, top, left + size, top + size))
+
+    return img  # PIL Image, kích thước (size, size)
+
+
+# -----------------------------------------------------------------------------
 
 
 def random_resized_crop(
     img: Image.Image,
-    img_size: int = DEFAULT_IMG_SIZE,
-    scale: tuple[float, float] = (0.75, 1.0),
-    ratio: tuple[float, float] = (0.85, 1.15),
+    size: int = IMG_SIZE,
+    scale: tuple = (0.75, 1.0),
+    ratio: tuple = (0.85, 1.15),
     rng: random.Random | None = None,
 ) -> Image.Image:
-    """Crop a random region matching torchvision RandomResizedCrop and resize."""
+    """
+    Cắt một vùng ngẫu nhiên trên ảnh rồi resize về size×size.
+
+    Tại sao cần bước này?
+    - Giúp model học nhận diện trái cây ở nhiều vị trí và tỷ lệ khác nhau.
+    - Trong thực tế, trái cây có thể chiếm 75% ảnh hoặc gần 100%, to hoặc nhỏ.
+
+    Cách hoạt động:
+    1. Chọn ngẫu nhiên diện tích vùng crop: area_crop = area_gốc × [0.75, 1.0]
+    2. Chọn ngẫu nhiên tỷ lệ cạnh: aspect ∈ [0.85, 1.15]  (gần vuông)
+    3. Từ area và aspect, tính cw × ch:  cw = √(area × aspect),  ch = √(area / aspect)
+    4. Chọn ngẫu nhiên vị trí top-left trong ảnh gốc, cắt rồi resize → size×size.
+    """
     gen = rng or random
     w, h = img.size
     area = w * h
-    log_ratio = (math.log(ratio[0]), math.log(ratio[1]))
 
-    for _ in range(10):
+    for _ in range(10):  # thử 10 lần để tìm crop hợp lệ
         target_area = gen.uniform(*scale) * area
-        aspect = math.exp(gen.uniform(*log_ratio))
-        cw = round(math.sqrt(target_area * aspect))
-        ch = round(math.sqrt(target_area / aspect))
+        aspect      = math.exp(gen.uniform(math.log(ratio[0]), math.log(ratio[1])))
+        cw = round(math.sqrt(target_area * aspect))   # crop width
+        ch = round(math.sqrt(target_area / aspect))   # crop height
+
         if 0 < cw <= w and 0 < ch <= h:
-            top = gen.randint(0, h - ch)
             left = gen.randint(0, w - cw)
+            top  = gen.randint(0, h - ch)
             return img.crop((left, top, left + cw, top + ch)).resize(
-                (img_size, img_size), Image.Resampling.BILINEAR
+                (size, size), Image.Resampling.BILINEAR
             )
 
-    # Fallback to largest central crop matching target aspect ratio.
-    in_ratio = w / h
-    if in_ratio < min(ratio):
-        cw = w
-        ch = round(cw / min(ratio))
-    elif in_ratio > max(ratio):
-        ch = h
-        cw = round(ch * max(ratio))
+    # Fallback: lấy crop trung tâm lớn nhất nếu không tìm được vùng phù hợp
+    r = w / h
+    if r < ratio[0]:
+        cw, ch = w, round(w / ratio[0])
+    elif r > ratio[1]:
+        ch, cw = h, round(h * ratio[1])
     else:
         cw, ch = w, h
     left = (w - cw) // 2
-    top = (h - ch) // 2
+    top  = (h - ch) // 2
     return img.crop((left, top, left + cw, top + ch)).resize(
-        (img_size, img_size), Image.Resampling.BILINEAR
+        (size, size), Image.Resampling.BILINEAR
     )
 
 
-def random_flip(
-    img: Image.Image,
-    hflip_prob: float = 0.5,
-    vflip_prob: float = 0.0,
-    rng: random.Random | None = None,
-) -> Image.Image:
-    """Apply random horizontal and/or vertical flips."""
+# -----------------------------------------------------------------------------
+
+
+def flip_horizontal(img: Image.Image, prob: float = 0.5, rng: random.Random | None = None) -> Image.Image:
+    """
+    Lật ngang ảnh với xác suất `prob`.
+
+    Tại sao cần lật ngang?
+    - Trái cây đối xứng trái-phải (nhãn không thay đổi khi lật ngang).
+    - Lật ngang gấp đôi số biến thể ảnh mà không cần thêm dữ liệu thực.
+    - KHÔNG lật dọc quá nhiều vì trái cây trên cây/đĩa thường có hướng lên-xuống cố định.
+
+    Phép toán (NumPy ý nghĩa): pixel[i, j] = pixel[i, W-1-j]
+    → đảo thứ tự các cột từ phải sang trái.
+    """
     gen = rng or random
-    out = img
-    if hflip_prob > 0 and gen.random() < hflip_prob:
-        out = ImageOps.mirror(out)
-    if vflip_prob > 0 and gen.random() < vflip_prob:
-        out = ImageOps.flip(out)
-    return out
+    if gen.random() < prob:
+        return ImageOps.mirror(img)   # PIL: đảo cột trái↔phải
+    return img
 
 
-def random_rotate(
+# -----------------------------------------------------------------------------
+
+
+def rotate_image(
     img: Image.Image,
     max_degrees: float = 25.0,
     rng: random.Random | None = None,
     angle: float | None = None,
 ) -> Image.Image:
-    """Rotate image by a random angle in [-max_degrees, +max_degrees]."""
+    """
+    Xoay ảnh một góc ngẫu nhiên trong [-max_degrees, +max_degrees] độ.
+
+    Tham số `angle`: nếu truyền vào thì dùng góc cố định đó (hữu ích khi minh hoạ từng bước).
+    Nếu không truyền thì lấy ngẫu nhiên trong [-max_degrees, +max_degrees].
+
+    Tại sao cần xoay?
+    - Trái cây trong ảnh thực tế không bao giờ hoàn toàn thẳng đứng.
+    - Xoay giúp model tổng quát hoá tốt hơn với các góc nhìn khác nhau.
+
+    Chi tiết kỹ thuật:
+    - Dùng nội suy bilinear (BILINEAR) để ảnh sau xoay không bị "răng cưa".
+    - Vùng trống sau khi xoay được lấp bằng màu trung bình của ảnh
+      (thay vì màu đen) → tránh tạo ra cạnh màu đen giả tạo gây nhiễu cho model.
+    - expand=False: giữ nguyên kích thước ảnh (không mở rộng khung hình).
+    """
     gen = rng or random
-    deg = angle if angle is not None else gen.uniform(-max_degrees, max_degrees)
-    mean_color = tuple(int(round(v)) for v in ImageStat.Stat(img).mean[:3])
-    return img.rotate(deg, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=mean_color)
+    if angle is None:
+        angle = gen.uniform(-max_degrees, max_degrees)   # góc xoay tính bằng độ
+
+    # Tính màu trung bình của ảnh để lấp vùng trống sau xoay
+    arr = np.asarray(img, dtype=np.float32)
+    mean_color = tuple(int(arr[:, :, c].mean()) for c in range(3))  # (R̄, Ḡ, B̄)
+
+    return img.rotate(angle, resample=Image.Resampling.BILINEAR,
+                      expand=False, fillcolor=mean_color)
 
 
-def random_color_jitter(
+# -----------------------------------------------------------------------------
+
+
+def adjust_brightness(arr: np.ndarray, factor: float) -> np.ndarray:
+    """
+    Điều chỉnh độ sáng bằng cách nhân toàn bộ pixel với factor.
+
+    Công thức: pixel_mới = pixel_cũ × factor,  clip về [0, 255]
+
+    factor > 1.0 → sáng hơn  (factor = 1.25 → sáng thêm 25%)
+    factor < 1.0 → tối hơn   (factor = 0.75 → tối đi 25%)
+    factor = 1.0 → giữ nguyên
+
+    Tại sao cần?  Ảnh chụp trong nhà tối / ngoài trời sáng sẽ khác nhau rất nhiều.
+    Ta mô phỏng sự thay đổi này để model không "thuộc lòng" điều kiện ánh sáng.
+    """
+    out = arr.astype(np.float32) * factor      # nhân từng pixel với factor
+    return np.clip(out, 0, 255).astype(np.uint8)   # clip về [0, 255]
+
+
+def adjust_contrast(arr: np.ndarray, factor: float) -> np.ndarray:
+    """
+    Điều chỉnh độ tương phản xung quanh giá trị trung bình của ảnh.
+
+    Công thức: pixel_mới = (pixel_cũ − mean) × factor + mean,  clip [0, 255]
+
+    factor > 1.0 → tương phản cao hơn (sáng→sáng hơn, tối→tối hơn)
+    factor < 1.0 → tương phản thấp hơn (ảnh "xám xịt", ít nổi bật)
+    factor = 1.0 → giữ nguyên
+
+    Tại sao dùng mean?  Phép co giãn quanh mean đảm bảo giá trị trung bình
+    của ảnh không đổi, chỉ có "khoảng cách" giữa sáng-tối thay đổi.
+    """
+    img_float = arr.astype(np.float32)
+    mean = img_float.mean()                            # giá trị trung bình toàn ảnh
+    out  = (img_float - mean) * factor + mean          # co giãn quanh mean
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def adjust_saturation(arr: np.ndarray, factor: float) -> np.ndarray:
+    """
+    Điều chỉnh độ bão hoà màu (saturation) qua không gian màu HSV.
+
+    Tại sao cần đổi sang HSV?
+    - Trong RGB, R/G/B đều mang thông tin cả sáng lẫn màu → khó tách riêng màu sắc.
+    - Trong HSV: H = màu sắc, S = độ đậm màu, V = độ sáng → chỉnh S thuần tuý.
+
+    Công thức:
+      1. RGB → HSV (H ∈ [0,1], S ∈ [0,1], V ∈ [0,1])
+      2. S_mới = S × factor,  clip về [0, 1]
+      3. HSV → RGB
+
+    factor > 1.0 → màu đậm hơn (vivid)
+    factor < 1.0 → màu nhạt hơn, gần xám
+    factor = 0.0 → ảnh trắng đen hoàn toàn
+
+    Lưu ý: H (màu sắc) không thay đổi → màu Bưởi/Hồng/Đu đủ vẫn được bảo toàn.
+    """
+    img_float = arr.astype(np.float32) / 255.0   # scale về [0, 1]
+    R, G, B = img_float[:, :, 0], img_float[:, :, 1], img_float[:, :, 2]
+
+    # --- RGB → HSV (công thức chuẩn) ---
+    Cmax = np.maximum(np.maximum(R, G), B)   # V = Cmax
+    Cmin = np.minimum(np.minimum(R, G), B)
+    delta = Cmax - Cmin                       # range = Cmax - Cmin
+
+    # H (Hue): góc màu trên vòng tròn màu [0°, 360°] → scale về [0, 1]
+    H = np.zeros_like(R)
+    mask_r = (Cmax == R) & (delta > 0)
+    mask_g = (Cmax == G) & (delta > 0)
+    mask_b = (Cmax == B) & (delta > 0)
+    H[mask_r] = ((G[mask_r] - B[mask_r]) / delta[mask_r]) % 6
+    H[mask_g] = (B[mask_g] - R[mask_g]) / delta[mask_g] + 2
+    H[mask_b] = (R[mask_b] - G[mask_b]) / delta[mask_b] + 4
+    H = H / 6.0  # về [0, 1]
+
+    # S (Saturation): tỷ lệ "thuần sắc" so với tổng sáng
+    # np.divide với where để tránh chia cho 0 khi pixel hoàn toàn tối (Cmax=0)
+    S = np.divide(delta, Cmax, out=np.zeros_like(delta), where=Cmax > 0)
+
+    # V (Value): độ sáng = kênh lớn nhất
+    V = Cmax
+
+    # --- Điều chỉnh độ bão hoà ---
+    S_new = np.clip(S * factor, 0.0, 1.0)   # chỉ chỉnh S, H và V giữ nguyên
+
+    # --- HSV → RGB (công thức chuẩn) ---
+    C  = V * S_new                            # Chroma
+    X  = C * (1 - np.abs((H * 6) % 2 - 1))  # giá trị phụ
+    m  = V - C                                # offset sáng
+
+    H6 = H * 6                               # sector [0, 6)
+    R2 = np.select(
+        [H6 < 1, H6 < 2, H6 < 3, H6 < 4, H6 < 5, H6 < 6],
+        [C, X, 0*C, 0*C, X, C]
+    )
+    G2 = np.select(
+        [H6 < 1, H6 < 2, H6 < 3, H6 < 4, H6 < 5, H6 < 6],
+        [X, C, C, X, 0*C, 0*C]
+    )
+    B2 = np.select(
+        [H6 < 1, H6 < 2, H6 < 3, H6 < 4, H6 < 5, H6 < 6],
+        [0*C, 0*C, X, C, C, X]
+    )
+
+    result = np.stack([R2 + m, G2 + m, B2 + m], axis=2)
+    return np.clip(result * 255, 0, 255).astype(np.uint8)
+
+
+def color_jitter(
     img: Image.Image,
     brightness: float = 0.25,
-    contrast: float = 0.20,
+    contrast:   float = 0.20,
     saturation: float = 0.20,
     rng: random.Random | None = None,
 ) -> Image.Image:
-    """Apply randomized brightness, contrast, and saturation adjustments."""
-    gen = rng or random
-    ops: list[tuple[Callable[[Image.Image], Any], float]] = [
-        (ImageEnhance.Brightness, brightness),
-        (ImageEnhance.Contrast, contrast),
-        (ImageEnhance.Color, saturation),
-    ]
-    gen.shuffle(ops)
-    out = img
-    for enhancer_cls, delta in ops:
-        if delta > 0:
-            factor = gen.uniform(max(0.0, 1.0 - delta), 1.0 + delta)
-            out = enhancer_cls(out).enhance(factor)
-    return out
-
-
-def apply_train_augmentations(
-    source: str | Path | Image.Image,
-    cfg: AugmentConfig = AugmentConfig(),
-    seed: int | None = None,
-) -> Image.Image:
-    """Apply full training augmentation pipeline returning a 224x224 RGB PIL Image."""
-    rng = random.Random(seed) if seed is not None else random
-    img = load_rgb_image(source)
-    img = random_resized_crop(img, cfg.img_size, cfg.crop_scale, cfg.crop_ratio, rng=rng)
-    img = random_flip(img, cfg.hflip_prob, cfg.vflip_prob, rng=rng)
-    img = random_rotate(img, cfg.rotation_degrees, rng=rng)
-    img = random_color_jitter(img, cfg.brightness, cfg.contrast, cfg.saturation, rng=rng)
-    return img
-
-
-def normalize_image(
-    img: Image.Image,
-    model_name: str = "mobilenet_v2",
-) -> Any:
-    """Normalize a 224x224 RGB PIL Image according to the target model specification.
-
-    Returns a float32 NumPy array of shape (H, W, 3) when NumPy is available,
-    otherwise returns a nested Python float list of shape [H][W][3].
     """
-    _, spec = resolve_model_config(model_name)
-    target_size = spec["input_size"]
-    if img.size != target_size:
-        img = img.resize(target_size, Image.Resampling.BILINEAR)
-    img = img.convert("RGB")
+    Áp dụng ngẫu nhiên brightness, contrast, saturation theo thứ tự ngẫu nhiên.
 
-    mean = spec["mean"]
-    std = spec["std"]
+    Tại sao áp dụng ngẫu nhiên thứ tự?
+    - Brightness trước Contrast cho kết quả khác Contrast trước Brightness.
+    - Xáo trộn thứ tự tạo ra đa dạng hơn các biến thể ảnh.
 
-    try:
-        import numpy as np
+    Với mỗi phép biến đổi, factor được lấy ngẫu nhiên trong [1-δ, 1+δ]:
+      brightness: factor ∈ [0.75, 1.25]  (±25%)
+      contrast:   factor ∈ [0.80, 1.20]  (±20%)
+      saturation: factor ∈ [0.80, 1.20]  (±20%)
+    """
+    gen = rng or random
+    arr = np.asarray(img, dtype=np.uint8).copy()
 
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-        mean_arr = np.asarray(mean, dtype=np.float32)
-        std_arr = np.asarray(std, dtype=np.float32)
-        return (arr - mean_arr) / std_arr
-    except ImportError:
-        w, h = img.size
-        get_px = getattr(img, "get_flattened_data", img.getdata)
-        raw = list(get_px())
-        rows: list[list[list[float]]] = []
-        for y in range(h):
-            row: list[list[float]] = []
-            off = y * w
-            for x in range(w):
-                r, g, b = raw[off + x]
-                row.append([
-                    (r / 255.0 - mean[0]) / std[0],
-                    (g / 255.0 - mean[1]) / std[1],
-                    (b / 255.0 - mean[2]) / std[2],
-                ])
-            rows.append(row)
-        return rows
+    # Danh sách các phép biến đổi kèm cường độ delta
+    ops = [
+        (adjust_brightness, brightness),
+        (adjust_contrast,   contrast),
+        (adjust_saturation, saturation),
+    ]
+    gen.shuffle(ops)   # xáo trộn thứ tự áp dụng
+
+    for fn, delta in ops:
+        # factor ∈ [1 - delta, 1 + delta], đảm bảo không âm
+        factor = gen.uniform(max(0.0, 1.0 - delta), 1.0 + delta)
+        arr = fn(arr, factor)
+
+    return Image.fromarray(arr, mode="RGB")
 
 
-def denormalize_array(
-    arr: Any,
-    model_name: str = "mobilenet_v2",
-) -> Image.Image:
-    """Convert a normalized (H, W, 3) array/nested-list back into a displayable PIL Image."""
-    _, spec = resolve_model_config(model_name)
-    mean = spec["mean"]
-    std = spec["std"]
-
-    try:
-        import numpy as np
-
-        np_arr = np.asarray(arr, dtype=np.float32)
-        if np_arr.ndim == 3 and np_arr.shape[0] == 3 and np_arr.shape[2] != 3:
-            np_arr = np.transpose(np_arr, (1, 2, 0))
-        restored = np_arr * np.asarray(std, dtype=np.float32) + np.asarray(mean, dtype=np.float32)
-        restored = np.clip(restored * 255.0, 0, 255).astype(np.uint8)
-        return Image.fromarray(restored, mode="RGB")
-    except ImportError:
-        h = len(arr)
-        w = len(arr[0]) if h else 0
-        out = Image.new("RGB", (w, h))
-        pixels: list[tuple[int, int, int]] = []
-        for row in arr:
-            for pix in row:
-                rgb = tuple(
-                    max(0, min(255, round((pix[c] * std[c] + mean[c]) * 255.0)))
-                    for c in range(3)
-                )
-                pixels.append(rgb)
-        out.putdata(pixels)
-        return out
+# -----------------------------------------------------------------------------
 
 
-def preprocess_image(
+def normalize(arr: np.ndarray) -> np.ndarray:
+    """
+    Chuẩn hoá ảnh theo ImageNet mean & std.
+
+    Công thức (theo từng kênh RGB):
+        pixel_chuẩn_hoá = (pixel / 255.0 − mean) / std
+
+    Bước 1: pixel / 255.0  → đưa giá trị từ [0, 255] về [0.0, 1.0]
+    Bước 2: (pixel − mean) → trừ giá trị trung bình của ImageNet
+    Bước 3: / std          → chia độ lệch chuẩn của ImageNet
+
+    Kết quả: float32 array shape (H, W, 3), giá trị khoảng [-2.0, +2.0]
+
+    Tại sao dùng ImageNet mean/std?
+    - MobileNetV2, ResNet50, YOLOv5 được pre-train trên ImageNet với chuẩn hoá này.
+    - Nếu không chuẩn hoá đúng cách, phân phối đầu vào sẽ khác với lúc pre-train
+      → model không tận dụng được trọng số đã học (transfer learning kém hiệu quả).
+    """
+    img_float = arr.astype(np.float32) / 255.0            # [0, 255] → [0.0, 1.0]
+    normalized = (img_float - IMAGENET_MEAN) / IMAGENET_STD  # (H, W, 3) broadcast
+    return normalized.astype(np.float32)
+
+
+def denormalize(arr: np.ndarray) -> Image.Image:
+    """
+    Đảo ngược chuẩn hoá: float32 (H, W, 3) → PIL Image uint8.
+
+    Công thức ngược lại:
+        pixel_gốc = (pixel_chuẩn_hoá × std + mean) × 255
+
+    Dùng để: hiển thị lại ảnh sau khi đã chuẩn hoá (ví dụ kiểm tra kết quả).
+    """
+    # Nếu array có shape (3, H, W) thì chuyển về (H, W, 3)
+    if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[2] != 3:
+        arr = np.transpose(arr, (1, 2, 0))
+
+    restored = arr * IMAGENET_STD + IMAGENET_MEAN    # đảo chuẩn hoá
+    restored = np.clip(restored * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(restored, mode="RGB")
+
+
+# =============================================================================
+# Phần 3 — Pipeline tổng hợp
+# =============================================================================
+
+
+def preprocess_train(
     source: str | Path | Image.Image,
-    model_name: str = "mobilenet_v2",
-    is_train: bool = False,
     cfg: AugmentConfig = AugmentConfig(),
     seed: int | None = None,
-) -> Any:
-    """End-to-end preprocessing: load -> (augment or eval resize 224x224) -> normalize."""
-    if is_train:
-        img = apply_train_augmentations(source, cfg=cfg, seed=seed)
-    else:
-        img = resize_224(load_rgb_image(source), img_size=cfg.img_size, keep_aspect_center_crop=True)
-    return normalize_image(img, model_name=model_name)
+) -> np.ndarray:
+    """
+    Pipeline tiền xử lý cho ảnh TRAIN (có tăng cường dữ liệu).
+
+    Các bước theo thứ tự:
+      1. load_image          → đọc ảnh, sửa EXIF, chuyển RGB
+      2. random_resized_crop → cắt vùng ngẫu nhiên 75~100% → resize 224×224
+      3. flip_horizontal     → lật ngang với xác suất 50%
+      4. rotate_image        → xoay ±25°
+      5. color_jitter        → thay đổi brightness/contrast/saturation ngẫu nhiên
+      6. normalize           → chuẩn hoá ImageNet → float32 (H, W, 3)
+
+    Trả về: np.ndarray float32, shape (224, 224, 3), giá trị ≈ [-2, +2]
+    """
+    rng = random.Random(seed) if seed is not None else random
+
+    img = load_image(source)                                           # Bước 1
+    img = random_resized_crop(img, cfg.img_size, cfg.crop_scale,
+                              cfg.crop_ratio, rng=rng)                 # Bước 2
+    img = flip_horizontal(img, prob=cfg.hflip_prob, rng=rng)          # Bước 3
+    img = rotate_image(img, max_degrees=cfg.rotation_degrees, rng=rng) # Bước 4
+    img = color_jitter(img, cfg.brightness, cfg.contrast,
+                       cfg.saturation, rng=rng)                        # Bước 5
+
+    arr = np.asarray(img, dtype=np.uint8)
+    return normalize(arr)                                              # Bước 6
 
 
-def build_torchvision_transforms(
-    model_name: str = "mobilenet_v2",
-    is_train: bool = True,
+def preprocess_eval(
+    source: str | Path | Image.Image,
     cfg: AugmentConfig = AugmentConfig(),
-):
-    """Build torchvision.transforms.Compose for Colab/PyTorch training and evaluation."""
-    canonical, spec = resolve_model_config(model_name)
-    if spec["framework"] != "pytorch":
-        raise ValueError(
-            f"build_torchvision_transforms is for PyTorch models, got '{canonical}' ({spec['framework']})."
-        )
-    from torchvision import transforms
+) -> np.ndarray:
+    """
+    Pipeline tiền xử lý cho ảnh VAL / TEST (không tăng cường).
 
-    normalize = transforms.Normalize(mean=spec["mean"], std=spec["std"])
-    if is_train:
-        return transforms.Compose([
-            transforms.RandomResizedCrop(
-                cfg.img_size,
-                scale=cfg.crop_scale,
-                ratio=cfg.crop_ratio,
-            ),
-            transforms.RandomHorizontalFlip(p=cfg.hflip_prob),
-            transforms.RandomVerticalFlip(p=cfg.vflip_prob),
-            transforms.RandomRotation(degrees=cfg.rotation_degrees),
-            transforms.ColorJitter(
-                brightness=cfg.brightness,
-                contrast=cfg.contrast,
-                saturation=cfg.saturation,
-                hue=cfg.hue,
-            ),
-            transforms.ToTensor(),
-            normalize,
-        ])
+    Các bước:
+      1. load_image              → đọc ảnh, sửa EXIF, chuyển RGB
+      2. resize_and_center_crop  → resize cạnh ngắn=256, center-crop 224×224
+      3. normalize               → chuẩn hoá ImageNet → float32 (H, W, 3)
 
-    return transforms.Compose([
-        transforms.Resize(cfg.eval_resize_short),
-        transforms.CenterCrop(cfg.img_size),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    Không augment vì: Val/Test dùng để đánh giá chính xác, cần ảnh chuẩn, không nhiễu.
+
+    Trả về: np.ndarray float32, shape (224, 224, 3)
+    """
+    img = load_image(source)                                # Bước 1
+    img = resize_and_center_crop(img, size=cfg.img_size)    # Bước 2
+    arr = np.asarray(img, dtype=np.uint8)
+    return normalize(arr)                                   # Bước 3
+
+
+# =============================================================================
+# Phần 4 — DataLoader wrappers (dùng khi huấn luyện trên GPU/Colab)
+# =============================================================================
+#
+# Tại sao cần phần này khi đã có preprocess_train/eval ở trên?
+# → preprocess_train/eval dùng NumPy thuần → chậm, chỉ xử lý 1 ảnh 1 lần.
+# → Khi train trên GPU (Colab), cần xử lý batch 32+ ảnh song song trên CPU.
+# → torchvision / tf.data tối ưu cho việc này: multi-thread, pipeline với GPU.
+# → Hai hàm bên dưới dùng CÙNG tham số AugmentConfig → kết quả tương đương.
+#
 
 
 def build_dataloaders(
     data_dir: str | Path,
-    model_name: str = "mobilenet_v2",
     batch_size: int = 32,
     num_workers: int = 2,
     cfg: AugmentConfig = AugmentConfig(),
 ):
-    """Create PyTorch DataLoaders for train/val/test folders under data_dir."""
+    """
+    Tạo PyTorch DataLoader cho train/val/test (dùng torchvision để tối ưu tốc độ).
+
+    Trả về:
+      loaders      — dict {"train": DataLoader, "val": DataLoader, "test": DataLoader}
+      class_to_idx — dict {"Buoi": 0, "Hong": 1, "dudu": 2}
+    """
     import torch
     from torch.utils.data import DataLoader
-    from torchvision import datasets
+    from torchvision import datasets, transforms
+
+    mean = IMAGENET_MEAN.tolist()
+    std  = IMAGENET_STD.tolist()
+
+    # Transform cho train: augment + normalize
+    train_tf = transforms.Compose([
+        transforms.RandomResizedCrop(cfg.img_size, scale=cfg.crop_scale, ratio=cfg.crop_ratio),
+        transforms.RandomHorizontalFlip(p=cfg.hflip_prob),
+        transforms.RandomVerticalFlip(p=0.0),          # không lật dọc
+        transforms.RandomRotation(degrees=cfg.rotation_degrees),
+        transforms.ColorJitter(
+            brightness=cfg.brightness,
+            contrast=cfg.contrast,
+            saturation=cfg.saturation,
+            hue=cfg.hue,                               # hue nhỏ (0.03) vì Bưởi/Đu đủ cùng màu xanh
+        ),
+        transforms.ToTensor(),                         # [0,255] uint8 → [0,1] float32, (H,W,3)→(3,H,W)
+        transforms.Normalize(mean=mean, std=std),      # chuẩn hoá ImageNet
+    ])
+
+    # Transform cho val/test: chỉ resize + crop + normalize (không augment)
+    eval_tf = transforms.Compose([
+        transforms.Resize(cfg.eval_resize_short),      # cạnh ngắn → 256px
+        transforms.CenterCrop(cfg.img_size),           # center crop 224×224
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
 
     root = Path(data_dir)
     loaders = {}
     class_to_idx = None
-    use_pin_memory = torch.cuda.is_available()
+    use_pin_memory = torch.cuda.is_available()         # pin_memory chỉ hữu ích khi có GPU
 
     for split in ("train", "val", "test"):
         split_dir = root / split
         if not split_dir.is_dir():
             continue
-        tf = build_torchvision_transforms(
-            model_name=model_name,
-            is_train=(split == "train"),
-            cfg=cfg,
-        )
+        tf = train_tf if split == "train" else eval_tf
         ds = datasets.ImageFolder(root=str(split_dir), transform=tf)
         if class_to_idx is None:
             class_to_idx = ds.class_to_idx
@@ -432,24 +584,26 @@ def build_dataloaders(
 
 def build_keras_datasets(
     data_dir: str | Path,
-    model_name: str = "mobilenet_v2_keras",
     batch_size: int = 32,
     seed: int = 42,
     cfg: AugmentConfig = AugmentConfig(),
 ):
-    """Build tf.data datasets with Keras augmentation & [-1, 1] MobileNetV2 normalization."""
+    """
+    Tạo tf.data.Dataset cho train/val/test với Keras (dùng cho TensorFlow/Keras MobileNetV2).
+
+    Khác với PyTorch:
+    - Keras MobileNetV2 cần đầu vào được scale về [-1, 1]: pixel_mới = pixel/127.5 - 1
+      (thay vì chuẩn hoá ImageNet của PyTorch)
+
+    Trả về:
+      datasets_out — dict {"train": tf.data.Dataset, "val": ..., "test": ...}
+      class_names  — list ["Buoi", "Hong", "dudu"]
+    """
     import tensorflow as tf
 
-    canonical, spec = resolve_model_config(model_name)
-    if spec["framework"] != "keras":
-        raise ValueError(
-            f"build_keras_datasets requires a Keras model config, got '{canonical}'."
-        )
-
     root = Path(data_dir)
-    img_shape = spec["input_size"]
 
-    # Keras layers for train augmentation (flip, rotate, zoom/crop, brightness/contrast)
+    # Augmentation layers cho train
     augment_layer = tf.keras.Sequential([
         tf.keras.layers.RandomFlip("horizontal"),
         tf.keras.layers.RandomRotation(cfg.rotation_degrees / 360.0),
@@ -458,11 +612,12 @@ def build_keras_datasets(
         tf.keras.layers.RandomContrast(factor=cfg.contrast),
     ], name="train_augmentation")
 
-    # MobileNetV2 Keras expects [-1, 1] scaling: (x / 127.5) - 1.0
+    # Scale [-1, 1]: (x / 127.5) - 1.0  (yêu cầu của Keras MobileNetV2)
     rescale_layer = tf.keras.layers.Rescaling(scale=1.0 / 127.5, offset=-1.0)
 
     datasets_out = {}
     class_names = None
+
     for split in ("train", "val", "test"):
         split_dir = root / split
         if not split_dir.is_dir():
@@ -471,13 +626,14 @@ def build_keras_datasets(
             str(split_dir),
             labels="inferred",
             label_mode="categorical",
-            image_size=img_shape,
+            image_size=(cfg.img_size, cfg.img_size),
             batch_size=batch_size,
             shuffle=(split == "train"),
             seed=seed,
         )
         if class_names is None:
             class_names = ds.class_names
+
         if split == "train":
             ds = ds.map(
                 lambda x, y: (rescale_layer(augment_layer(x, training=True)), y),
@@ -493,43 +649,55 @@ def build_keras_datasets(
     return datasets_out, class_names
 
 
-def run_self_test(data_dir: Path | None = None) -> dict[str, Any]:
-    """Verify PIL preprocessing, augmentations, and model-specific normalizations."""
+# =============================================================================
+# Phần 5 — Self-test & CLI
+# =============================================================================
+
+
+def run_self_test(data_dir: Path | None = None) -> dict:
+    """
+    Kiểm tra nhanh toàn bộ pipeline với ảnh giả (không cần dataset thực).
+
+    Kiểm tra:
+    1. preprocess_train cho ra shape (224, 224, 3), deterministic với seed cố định
+    2. preprocess_eval cho ra shape (224, 224, 3)
+    3. Giá trị sau normalize nằm trong khoảng hợp lệ (≈ -3.0 đến +3.0)
+    4. denormalize trả về ảnh PIL đúng kích thước
+    5. (nếu có data_dir) đếm số ảnh trong mỗi split
+    """
+    # Tạo ảnh giả màu xanh lá (giống Bưởi/Đu đủ)
     sample = Image.new("RGB", (320, 240), (90, 160, 70))
     cfg = AugmentConfig()
 
-    aug1 = apply_train_augmentations(sample, cfg=cfg, seed=42)
-    aug2 = apply_train_augmentations(sample, cfg=cfg, seed=42)
-    assert aug1.size == (224, 224), f"Expected 224x224, got {aug1.size}"
-    get_px1 = getattr(aug1, "get_flattened_data", aug1.getdata)
-    get_px2 = getattr(aug2, "get_flattened_data", aug2.getdata)
-    assert list(get_px1()) == list(get_px2()), "Seeded augmentation should be deterministic"
+    # Kiểm tra 1: train pipeline, kết quả có shape đúng
+    out_train = preprocess_train(sample, cfg=cfg, seed=42)
+    assert out_train.shape == (224, 224, 3), f"Shape sai: {out_train.shape}"
 
-    eval_img = resize_224(sample, img_size=224, keep_aspect_center_crop=True)
-    assert eval_img.size == (224, 224)
+    # Kiểm tra 2: seed cố định → kết quả giống nhau (deterministic)
+    out_train2 = preprocess_train(sample, cfg=cfg, seed=42)
+    assert np.allclose(out_train, out_train2), "Seed cố định nhưng kết quả khác nhau!"
 
-    summary: dict[str, Any] = {
-        "augment_size": aug1.size,
+    # Kiểm tra 3: eval pipeline
+    out_eval = preprocess_eval(sample, cfg=cfg)
+    assert out_eval.shape == (224, 224, 3), f"Eval shape sai: {out_eval.shape}"
+
+    # Kiểm tra 4: giá trị sau normalize hợp lệ
+    vmin, vmax = float(out_eval.min()), float(out_eval.max())
+    assert -3.5 <= vmin <= vmax <= 3.5, f"Giá trị normalize ngoài khoảng: {vmin}..{vmax}"
+
+    # Kiểm tra 5: denormalize trả về ảnh PIL đúng
+    restored = denormalize(out_eval)
+    assert restored.size == (224, 224), f"Denormalize size sai: {restored.size}"
+
+    summary: dict = {
+        "train_shape": list(out_train.shape),
+        "eval_shape":  list(out_eval.shape),
+        "normalized_min": round(vmin, 4),
+        "normalized_max": round(vmax, 4),
         "deterministic_seed": True,
-        "models": {},
     }
 
-    for m_name in MODEL_CONFIGS:
-        norm = preprocess_image(sample, model_name=m_name, is_train=False, cfg=cfg)
-        flat = (
-            norm.reshape(-1).tolist()
-            if hasattr(norm, "reshape")
-            else [v for row in norm for px in row for v in px]
-        )
-        vmin, vmax = min(flat), max(flat)
-        if m_name == "mobilenet_v2_keras":
-            assert -1.001 <= vmin <= vmax <= 1.001, f"Keras range invalid: {vmin}..{vmax}"
-        else:
-            assert -3.0 <= vmin <= vmax <= 3.0, f"ImageNet range invalid: {vmin}..{vmax}"
-        restored = denormalize_array(norm, model_name=m_name)
-        assert restored.size == (224, 224)
-        summary["models"][m_name] = {"min": round(vmin, 4), "max": round(vmax, 4)}
-
+    # Đếm số ảnh trong dataset (nếu có)
     if data_dir and data_dir.is_dir():
         split_counts = {}
         for split in ("train", "val", "test"):
@@ -542,6 +710,7 @@ def run_self_test(data_dir: Path | None = None) -> dict[str, Any]:
                 }
         summary["dataset_counts"] = split_counts
 
+    # Kiểm tra các thư viện bổ sung có sẵn không
     for pkg in ("torch", "torchvision", "tensorflow"):
         try:
             __import__(pkg)
@@ -553,17 +722,21 @@ def run_self_test(data_dir: Path | None = None) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fruit preprocessing and augmentation helper")
-    parser.add_argument("--data-dir", type=Path, default=Path("fruit_classfication/data"))
-    parser.add_argument("--self-test", action="store_true", help="Run preprocessing sanity checks")
-    parser.add_argument("--print-config", action="store_true", help="Print model & augmentation configs")
+    parser = argparse.ArgumentParser(description="Tiền xử lý ảnh trái cây")
+    parser.add_argument("--data-dir", type=Path, default=Path("fruit_classfication/data"),
+                        help="Thư mục data chứa train/val/test")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Chạy kiểm tra nhanh toàn bộ pipeline")
+    parser.add_argument("--print-config", action="store_true",
+                        help="In cấu hình augmentation")
     args = parser.parse_args()
 
     if args.print_config:
-        print(json.dumps({"augment": asdict(AugmentConfig()), "models": MODEL_CONFIGS}, indent=2))
+        print(json.dumps(asdict(AugmentConfig()), indent=2, ensure_ascii=False))
+
     if args.self_test or not args.print_config:
-        res = run_self_test(args.data_dir)
-        print(json.dumps(res, indent=2))
+        result = run_self_test(args.data_dir)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
